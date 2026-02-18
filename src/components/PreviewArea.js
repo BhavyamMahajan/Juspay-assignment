@@ -1,17 +1,19 @@
-import React, { useState } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import CatSprite from "./CatSprite";
 import { useScratch } from "../context/ScratchContext";
 
-const SpriteRenderer = ({ sprite, speechBubble }) => {
+const SpriteRenderer = ({ sprite, speechBubble, onPointerDown }) => {
   return (
     <g
       transform={`translate(${sprite.x + 400}, ${sprite.y + 300}) rotate(${
         sprite.direction
       })`}
-      style={{ transition: "transform 0.1s linear" }}
+      style={{ transition: "transform 0.05s linear", cursor: "grab" }}
+      onMouseDown={(e) => onPointerDown(e, sprite)}
+      onTouchStart={(e) => onPointerDown(e.touches ? e.touches[0] : e, sprite)}
     >
       <foreignObject x="-47.5" y="-50" width="95" height="100">
-        <div style={{ width: "95px", height: "100px" }}>
+        <div style={{ width: "95px", height: "100px", touchAction: "none" }}>
           <CatSprite />
         </div>
       </foreignObject>
@@ -48,8 +50,117 @@ export default function PreviewArea() {
   const [speechBubbles, setSpeechBubbles] = useState({});
   const [isRunning, setIsRunning] = useState(false);
 
+  const svgRef = useRef(null);
+  const dragRef = useRef(null); // { id, offsetX, offsetY }
+  const isDraggingRef = useRef(false);
+
+  // Playground bounds in sprite coordinate space (centered at 0,0)
+  const BOUNDS = {
+    minX: -352.5, //  -400 + half sprite width (47.5)
+    maxX: 352.5, //   400 - half sprite width
+    minY: -250, //  -300 + half sprite height (50)
+    maxY: 250, //   300 - half sprite height
+  };
+
+  const clampPosition = (s) => {
+    const clamped = {
+      ...s,
+      x: Math.max(BOUNDS.minX, Math.min(BOUNDS.maxX, s.x)),
+      y: Math.max(BOUNDS.minY, Math.min(BOUNDS.maxY, s.y)),
+    };
+    return clamped;
+  };
+
+  // Convert client coords to sprite-space (centered at 0,0)
+  const clientToSpriteCoords = (clientX, clientY) => {
+    const svg = svgRef.current;
+    if (!svg) return { x: 0, y: 0 };
+    const rect = svg.getBoundingClientRect();
+    const viewBoxWidth = 800;
+    const viewBoxHeight = 600;
+    const scaleX = viewBoxWidth / rect.width;
+    const scaleY = viewBoxHeight / rect.height;
+    const svgX = (clientX - rect.left) * scaleX;
+    const svgY = (clientY - rect.top) * scaleY;
+    // convert to centered coords where (400,300) is origin
+    return { x: svgX - viewBoxWidth / 2, y: svgY - viewBoxHeight / 2 };
+  };
+
+  const onPointerDown = (event, sprite) => {
+    if (isRunning || isPlaying) return;
+    event.preventDefault?.();
+    const clientX = event.clientX;
+    const clientY = event.clientY;
+    const point = clientToSpriteCoords(clientX, clientY);
+    dragRef.current = {
+      id: sprite.id,
+      offsetX: point.x - (sprite.x || 0),
+      offsetY: point.y - (sprite.y || 0),
+    };
+    isDraggingRef.current = true;
+
+    // Add listeners
+    window.addEventListener("mousemove", onPointerMove);
+    window.addEventListener("mouseup", onPointerUp);
+    window.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("touchend", onPointerUp);
+  };
+
+  const onPointerMove = (e) => {
+    if (!isDraggingRef.current || !dragRef.current) return;
+    e.preventDefault?.();
+    const clientX = e.clientX;
+    const clientY = e.clientY;
+    moveDraggedSprite(clientX, clientY);
+  };
+
+  const onTouchMove = (e) => {
+    if (!isDraggingRef.current || !dragRef.current) return;
+    e.preventDefault();
+    const t = e.touches[0];
+    if (!t) return;
+    moveDraggedSprite(t.clientX, t.clientY);
+  };
+
+  const moveDraggedSprite = (clientX, clientY) => {
+    const dr = dragRef.current;
+    if (!dr) return;
+    const point = clientToSpriteCoords(clientX, clientY);
+    const newPos = {
+      x: point.x - dr.offsetX,
+      y: point.y - dr.offsetY,
+    };
+    const clamped = clampPosition(newPos);
+
+    setSprites((prev) =>
+      prev.map((s) =>
+        s.id === dr.id ? { ...s, x: clamped.x, y: clamped.y } : s,
+      ),
+    );
+  };
+
+  const onPointerUp = (e) => {
+    if (!isDraggingRef.current) return;
+    isDraggingRef.current = false;
+    dragRef.current = null;
+    window.removeEventListener("mousemove", onPointerMove);
+    window.removeEventListener("mouseup", onPointerUp);
+    window.removeEventListener("touchmove", onTouchMove);
+    window.removeEventListener("touchend", onPointerUp);
+  };
+
+  useEffect(() => {
+    return () => {
+      // cleanup in case component unmounts mid-drag
+      window.removeEventListener("mousemove", onPointerMove);
+      window.removeEventListener("mouseup", onPointerUp);
+      window.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("touchend", onPointerUp);
+    };
+  }, []);
+
   const executeBlock = async (sprite, block, currentSpriteState) => {
-    const updatedSprite = { ...currentSpriteState };
+    let updatedSprite = { ...currentSpriteState };
 
     switch (block.type) {
       case "moveSteps": {
@@ -59,8 +170,10 @@ export default function PreviewArea() {
           updatedSprite.y += Math.sin(angle) * block.params.steps;
         } else updatedSprite.x += block.params.steps;
 
+        updatedSprite = clampPosition(updatedSprite);
+
         setSprites((prev) =>
-          prev.map((s) => (s.id === sprite.id ? updatedSprite : s))
+          prev.map((s) => (s.id === sprite.id ? updatedSprite : s)),
         );
         await new Promise((resolve) => setTimeout(resolve, 100));
         return updatedSprite;
@@ -68,7 +181,7 @@ export default function PreviewArea() {
       case "turnRight": {
         updatedSprite.direction += block.params.degrees;
         setSprites((prev) =>
-          prev.map((s) => (s.id === sprite.id ? updatedSprite : s))
+          prev.map((s) => (s.id === sprite.id ? updatedSprite : s)),
         );
         await new Promise((resolve) => setTimeout(resolve, 100));
         return updatedSprite;
@@ -76,7 +189,7 @@ export default function PreviewArea() {
       case "turnLeft": {
         updatedSprite.direction -= block.params.degrees;
         setSprites((prev) =>
-          prev.map((s) => (s.id === sprite.id ? updatedSprite : s))
+          prev.map((s) => (s.id === sprite.id ? updatedSprite : s)),
         );
         await new Promise((resolve) => setTimeout(resolve, 100));
         return updatedSprite;
@@ -84,8 +197,11 @@ export default function PreviewArea() {
       case "goToXY": {
         updatedSprite.x = block.params.x;
         updatedSprite.y = block.params.y;
+
+        updatedSprite = clampPosition(updatedSprite);
+
         setSprites((prev) =>
-          prev.map((s) => (s.id === sprite.id ? updatedSprite : s))
+          prev.map((s) => (s.id === sprite.id ? updatedSprite : s)),
         );
         await new Promise((resolve) => setTimeout(resolve, 100));
         return updatedSprite;
@@ -102,7 +218,7 @@ export default function PreviewArea() {
           },
         }));
         await new Promise((resolve) =>
-          setTimeout(resolve, block.params.seconds * 1000)
+          setTimeout(resolve, block.params.seconds * 1000),
         );
         setSpeechBubbles((prev) => {
           const newBubbles = { ...prev };
@@ -123,7 +239,7 @@ export default function PreviewArea() {
           },
         }));
         await new Promise((resolve) =>
-          setTimeout(resolve, block.params.seconds * 1000)
+          setTimeout(resolve, block.params.seconds * 1000),
         );
         setSpeechBubbles((prev) => {
           const newBubbles = { ...prev };
@@ -142,7 +258,7 @@ export default function PreviewArea() {
             repeatSprite = await executeBlock(
               sprite,
               nestedBlock,
-              repeatSprite
+              repeatSprite,
             );
           }
         }
@@ -167,12 +283,12 @@ export default function PreviewArea() {
     const spriteExecution = {};
 
     for (const sprite of sprites) {
-      spriteStates[sprite.id] = {
+      spriteStates[sprite.id] = clampPosition({
         ...sprite,
         x: sprite.x || 0,
         y: sprite.y || 0,
         direction: sprite.direction || 0,
-      };
+      });
       spriteExecution[sprite.id] = {
         actions: [...sprite.actions],
         currentIndex: 0,
@@ -181,7 +297,7 @@ export default function PreviewArea() {
 
     // Execute all sprites step by step
     const maxActions = Math.max(
-      ...Object.values(spriteExecution).map((e) => e.actions.length)
+      ...Object.values(spriteExecution).map((e) => e.actions.length),
     );
 
     for (let step = 0; step < maxActions; step++) {
@@ -197,8 +313,10 @@ export default function PreviewArea() {
               actions: execution.actions,
             },
             block,
-            spriteStates[spriteId]
+            spriteStates[spriteId],
           );
+          // Ensure state is clamped after execution
+          spriteStates[spriteId] = clampPosition(spriteStates[spriteId]);
           execution.currentIndex++;
         }
       }
@@ -215,7 +333,7 @@ export default function PreviewArea() {
         for (let j = i + 1; j < spriteArray.length; j++) {
           const pairKey = `${Math.min(
             spriteArray[i].id,
-            spriteArray[j].id
+            spriteArray[j].id,
           )}-${Math.max(spriteArray[i].id, spriteArray[j].id)}`;
 
           if (
@@ -262,20 +380,31 @@ export default function PreviewArea() {
               const separation = 55; // Slightly more than collision threshold
               const angle = Math.atan2(dy, dx);
 
-              spriteStates[spriteArray[i].id].x =
-                spriteArray[j].x + Math.cos(angle) * separation;
-              spriteStates[spriteArray[i].id].y =
-                spriteArray[j].y + Math.sin(angle) * separation;
+              const newPosI = clampPosition({
+                ...spriteStates[spriteArray[i].id],
+                x: spriteArray[j].x + Math.cos(angle) * separation,
+                y: spriteArray[j].y + Math.sin(angle) * separation,
+              });
 
-              // Update the sprite state
+              const newPosJ = clampPosition({
+                ...spriteStates[spriteArray[j].id],
+                // Optional small push in opposite direction if needed
+                x: spriteArray[i].x - Math.cos(angle) * separation,
+                y: spriteArray[i].y - Math.sin(angle) * separation,
+              });
+
+              spriteStates[spriteArray[i].id] = newPosI;
+              spriteStates[spriteArray[j].id] = newPosJ;
+
+              // Update the sprite state visible immediately
               setSprites((prev) =>
                 prev.map((s) =>
                   s.id === spriteArray[i].id
                     ? { ...s, ...spriteStates[spriteArray[i].id] }
                     : s.id === spriteArray[j].id
-                    ? { ...s, ...spriteStates[spriteArray[j].id] }
-                    : s
-                )
+                      ? { ...s, ...spriteStates[spriteArray[j].id] }
+                      : s,
+                ),
               );
             }
           }
@@ -288,15 +417,16 @@ export default function PreviewArea() {
       prev.map((s) => {
         const finalState = spriteStates[s.id];
         if (finalState) {
+          const clamped = clampPosition(finalState);
           return {
             ...s,
-            x: finalState.x,
-            y: finalState.y,
-            direction: finalState.direction,
+            x: clamped.x,
+            y: clamped.y,
+            direction: clamped.direction,
           };
         }
         return s;
-      })
+      }),
     );
 
     setIsPlaying(false);
@@ -305,7 +435,7 @@ export default function PreviewArea() {
 
   const checkCollision = (sprite1, sprite2) => {
     const distance = Math.sqrt(
-      Math.pow(sprite1.x - sprite2.x, 2) + Math.pow(sprite1.y - sprite2.y, 2)
+      Math.pow(sprite1.x - sprite2.x, 2) + Math.pow(sprite1.y - sprite2.y, 2),
     );
     return distance < 50; // Collision threshold
   };
@@ -324,11 +454,12 @@ export default function PreviewArea() {
         Run
       </button>
       <svg
+        ref={svgRef}
         width="100%"
         height="100%"
         viewBox="0 0 800 600"
         className="border-2 border-gray-300 bg-white rounded"
-        style={{ display: "block" }}
+        style={{ display: "block", touchAction: "none" }}
       >
         {sprites && sprites.length > 0 ? (
           sprites.map((sprite) => (
@@ -336,6 +467,7 @@ export default function PreviewArea() {
               key={sprite.id}
               sprite={sprite}
               speechBubble={speechBubbles[sprite.id]}
+              onPointerDown={onPointerDown}
             />
           ))
         ) : (
